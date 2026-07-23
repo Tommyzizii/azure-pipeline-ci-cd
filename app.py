@@ -81,7 +81,7 @@ def home():
     <body>
         <div class="card">
             <h1>{APP_NAME}</h1>
-            <p class="tag">Shipped via Docker &amp; deployed with CI/CD 🚀</p>
+            <p class="tag">Shipped via Docker; deployed CI/CD Github Actions</p>
             <div class="meta">
                 <span class="label">Version</span><span>{APP_VERSION}</span>
                 <span class="label">Environment</span><span>{ENVIRONMENT}</span>
