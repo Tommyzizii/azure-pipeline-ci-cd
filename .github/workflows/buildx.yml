@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
     paths:
       - 'app/backend/**'
       - 'app/frontend/**'
@@ -13,21 +15,33 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
-      image_tag:
-        description: 'Manual image tag (defaults to short SHA)'
-        required: false
-        default: ''
+      service:
+        description: 'Which service to build'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - backend
+          - frontend
+          - integration
+      push_image:
+        description: 'Push image to ACR? (false = build only, no push)'
+        required: true
+        default: true
+        type: boolean
   schedule:
-    - cron: '0 2 * * 0'   # weekly Sunday 02:00 UTC rebuild 
+    - cron: '0 2 * * 0'   # weekly Sunday 02:00 UTC rebuild (base-image patches)
 
 env:
   ACR_REGISTRY: learndevopsnow.azurecr.io
   APP_NAME: buildx-app
 
 jobs:
-  # Detect which service(s) changed so don't need to rebuild everything on every push.
-  # Any trigger other than a plain push (manual, release, schedule) rebuilds all services.
+  # detect which service dirs changed so
+  # plain branch pushes only rebuild what actually moved.
   changes:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
@@ -49,8 +63,27 @@ jobs:
               - 'app/integration/**'
               - 'requirements.txt'
 
+  # build-and-push only runs once this passes. 
+  # Replace the placeholder with real test/lint commands when ready.
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      test_status: ${{ steps.result.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests
+        run: |
+          echo "Running tests..."
+          echo "All tests passed."
+
+      - name: Save test status
+        id: result
+        run: echo "status=passed" >> "$GITHUB_OUTPUT"
+
   build-and-push:
-    needs: changes
+    needs: [changes, test]
+    if: needs.test.outputs.test_status == 'passed'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -64,22 +97,61 @@ jobs:
           - service: integration
             dockerfile: app/integration/Dockerfile
             context: .
-    # Build this service if: it changed on a push, OR the trigger isn't a push
-    # (manual dispatch, release, and schedule always rebuild every service).
-    if: |
-      github.event_name != 'push' ||
-      (matrix.service == 'backend' && needs.changes.outputs.backend == 'true') ||
-      (matrix.service == 'frontend' && needs.changes.outputs.frontend == 'true') ||
-      (matrix.service == 'integration' && needs.changes.outputs.integration == 'true')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # matrix isn't available in a job-level `if:`, so the per-service
+      # build/push decision happens here instead (ref: 01 + 03 combined).
+      - name: Determine whether to build/push this service
+        id: check
+        run: |
+          service="${{ matrix.service }}"
+          build="false"
+          push="true"
+
+          case "${{ github.event_name }}" in
+            workflow_dispatch)
+              if [ "${{ inputs.service }}" = "all" ] || [ "${{ inputs.service }}" = "$service" ]; then
+                build="true"
+              fi
+              push="${{ inputs.push_image }}"
+              ;;
+            push)
+              case "$service" in
+                backend) changed="${{ needs.changes.outputs.backend }}" ;;
+                frontend) changed="${{ needs.changes.outputs.frontend }}" ;;
+                integration) changed="${{ needs.changes.outputs.integration }}" ;;
+              esac
+              if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+                # tag pushes (v*.*.*) always rebuild every service
+                build="true"
+              elif [ "$changed" = "true" ]; then
+                build="true"
+              fi
+              ;;
+            release|schedule)
+              build="true"
+              ;;
+          esac
+
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+
+      # surface ref/tag context on tag & release builds
+      - name: Show release information
+        if: steps.check.outputs.build == 'true' && (github.event_name == 'release' || startsWith(github.ref, 'refs/tags/'))
+        run: |
+          echo "Ref: $GITHUB_REF"
+          echo "Ref Name: $GITHUB_REF_NAME"
+          echo "Event Name: $GITHUB_EVENT_NAME"
+
       - name: Determine image tag
         id: tag
+        if: steps.check.outputs.build == 'true'
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "release" ] || [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           elif [ -n "${{ github.event.inputs.image_tag }}" ]; then
             echo "tag=${{ github.event.inputs.image_tag }}" >> "$GITHUB_OUTPUT"
           else
@@ -87,6 +159,7 @@ jobs:
           fi
 
       - name: Login to Azure Container Registry
+        if: steps.check.outputs.build == 'true' && steps.check.outputs.push == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
@@ -94,15 +167,18 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Set up Docker Buildx
+        if: steps.check.outputs.build == 'true'
         uses: docker/setup-buildx-action@v3
 
-      - name: Build & Push Docker Image
+      # type=gha cache, scoped per service
+      - name: Build (& Push) Docker Image
+        if: steps.check.outputs.build == 'true'
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
+          push: ${{ steps.check.outputs.push == 'true' }}
           tags: |
             ${{ env.ACR_REGISTRY }}/${{ env.APP_NAME }}-${{ matrix.service }}:${{ steps.tag.outputs.tag }}
             ${{ env.ACR_REGISTRY }}/${{ env.APP_NAME }}-${{ matrix.service }}:latest
@@ -110,6 +186,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=acr-${{ matrix.service }}
 
       - name: Record build info artifact
+        if: steps.check.outputs.build == 'true'
         run: |
           mkdir -p build-info
           {
@@ -117,11 +194,13 @@ jobs:
             echo "registry=${{ env.ACR_REGISTRY }}"
             echo "image=${{ env.APP_NAME }}-${{ matrix.service }}"
             echo "tag=${{ steps.tag.outputs.tag }}"
+            echo "pushed=${{ steps.check.outputs.push }}"
             echo "trigger=${{ github.event_name }}"
             echo "sha=${{ github.sha }}"
           } > build-info/${{ matrix.service }}.txt
 
       - name: Upload build info artifact
+        if: steps.check.outputs.build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: acr-build-info-${{ matrix.service }}
