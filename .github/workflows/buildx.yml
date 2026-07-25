@@ -68,7 +68,9 @@ jobs:
     # (manual dispatch, release, and schedule always rebuild every service).
     if: |
       github.event_name != 'push' ||
-      needs.changes.outputs[matrix.service] == 'true'
+      (matrix.service == 'backend' && needs.changes.outputs.backend == 'true') ||
+      (matrix.service == 'frontend' && needs.changes.outputs.frontend == 'true') ||
+      (matrix.service == 'integration' && needs.changes.outputs.integration == 'true')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
